@@ -21,6 +21,7 @@ final class Controller: NSObject {
     private var observers: [NSObjectProtocol] = []
     private var refusalsLogged: Set<CFHashCode> = []
     private weak var lastFocused: Win?
+    private var saveWork: DispatchWorkItem?
     var statusItem: NSStatusItem?
     private var enabledItem: NSMenuItem?
     var enabled = true
@@ -54,6 +55,7 @@ final class Controller: NSObject {
 
     func start() {
         Controller.shared = self
+        restoreSavedState()
         installDebugHooks()
         requestAccessibility()
         buildMenuBar()
@@ -336,6 +338,9 @@ final class Controller: NSObject {
                     let win = Win(el: el, pid: pid, app: app, workspace: store.current)
                     win.frame = AX.currentFrame(el) ?? .zero
                     seedMinimum(for: win)
+                    // Put the window back where it was last time, not blindly on the current
+                    // workspace. This is what makes a restart feel like nothing moved.
+                    if let remembered = savedWorkspace(for: win) { win.workspace = remembered }
                     discovered.append(win)
                 }
             }
@@ -348,6 +353,7 @@ final class Controller: NSObject {
 
         parkOtherWorkspaces()
         apply()
+        scheduleSave()
 
         let trusted = AXIsProcessTrusted()
         log("refresh ws=\(store.current) tracked=\(store.byHash.count) onScreen=\(live.count) trusted=\(trusted)")
@@ -383,6 +389,52 @@ final class Controller: NSObject {
                     + "\(Int(after.width))x\(Int(after.height))")
             }
         }
+    }
+
+    // MARK: - persistence
+
+    /// Stable-enough identity for remembering where a window belongs across launches.
+    ///
+    /// The AXUIElement hash cannot be used: it is only valid for the lifetime of the element. App
+    /// bundle id plus window title survives a relaunch, at the cost that renaming a window (a new
+    /// browser tab, an unsaved document) makes it look like a new window and it lands on the
+    /// current workspace — a safe failure, never a lost window.
+    private func windowKey(_ win: Win) -> String {
+        (win.app.bundleIdentifier ?? "unknown") + "|" + win.title
+    }
+
+    private func savedWorkspace(for win: Win) -> String? {
+        let map = UserDefaults.standard.dictionary(forKey: "windowWorkspaces") as? [String: String]
+        return map?[windowKey(win)]
+    }
+
+    private func restoreSavedState() {
+        let defaults = UserDefaults.standard
+        if let workspace = defaults.string(forKey: "currentWorkspace"), !workspace.isEmpty {
+            store.current = workspace
+        }
+        if defaults.string(forKey: "orientation") == "v" {
+            store.orientation = .vertical
+        }
+    }
+
+    /// Coalesced so a burst of moves writes once, a second later.
+    private func scheduleSave() {
+        saveWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.saveState() }
+        saveWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+    }
+
+    func saveState() {
+        var map: [String: String] = [:]
+        for (_, win) in store.byHash {
+            map[windowKey(win)] = win.workspace
+        }
+        let defaults = UserDefaults.standard
+        defaults.set(map, forKey: "windowWorkspaces")
+        defaults.set(store.current, forKey: "currentWorkspace")
+        defaults.set(store.orientation == .horizontal ? "h" : "v", forKey: "orientation")
     }
 
     // MARK: - minimum sizes that apps impose on themselves
@@ -569,6 +621,7 @@ final class Controller: NSObject {
         store.move(win, to: store.current, at: j)
         apply()
         setFocus(win)
+        scheduleSave()
     }
 
     func resize(grow: Bool) {
@@ -580,11 +633,13 @@ final class Controller: NSObject {
     func toggleOrientation() {
         store.orientation = store.orientation.opposite
         apply()
+        scheduleSave()
     }
 
     func switchWorkspace(_ name: String) {
         guard store.current != name else { return }
         store.current = name
+        scheduleSave()
         apply()
         refresh()
         if let first = store.windows(name).first { setFocus(first) }
@@ -593,6 +648,7 @@ final class Controller: NSObject {
     func moveToWorkspace(_ name: String) {
         guard let win = focused() else { return }
         store.move(win, to: name)
+        scheduleSave()
         apply()
         if let next = store.windows(store.current).first { setFocus(next) }
     }
@@ -623,6 +679,8 @@ final class Controller: NSObject {
     }
 
     @objc func quit() {
+        saveWork?.cancel()
+        saveState()          // capture the arrangement as it is right now, not a second ago
         NSApp.terminate(nil)
     }
 

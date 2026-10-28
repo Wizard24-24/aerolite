@@ -80,6 +80,11 @@ keystroke system-wide, which is the usual reason a window manager burns idle CPU
   entirely — never tiled, never parked. Parking full-screen windows is what leaves a user on a
   black screen with no way back. Geometry is used only as a safety check before moving a window
   off-screen, never to decide whether to manage it.
+- **Placement survives restarts.** Each window is remembered by app bundle id + window title, so
+  after a relaunch or login it returns to the workspace it was on — the workspace itself, the
+  orientation and the current workspace all persist. A renamed window (a new browser tab, an
+  unsaved document) looks like a new window and lands on the current workspace: a safe fallback,
+  never a lost window.
 - **Other workspaces are hidden by parking** windows off-screen at x = −30000, re-verified on every
   refresh (apps restore their own frames on reactivation, so a one-shot park leaks).
 
