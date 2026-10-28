@@ -1,0 +1,12 @@
+# Build output
+build/
+*.iconset/
+
+# macOS
+.DS_Store
+._*
+
+# Swift Package Manager
+.build/
+*.xcodeproj
+xcuserdata/

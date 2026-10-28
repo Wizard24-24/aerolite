@@ -1,0 +1,81 @@
+import AppKit
+
+// AeroLite — a minimal, event-driven tiling window manager for macOS.
+//
+// Built to replace AeroSpace on machines where AeroSpace's cost is noticeable. The design notes
+// live at the top of Controller.swift; the short version is: no polling, coalesced refreshes,
+// diffed geometry writes, single-display tiling with virtual workspaces, and full-screen windows
+// left strictly alone.
+//
+// Modes:
+//   (none)        run the window manager as a menu-bar agent
+//   --diagnose    print permission + AX reachability from this binary's own identity, then exit
+
+if CommandLine.arguments.contains("--diagnose") {
+    // Running inside the bundle means TCC attributes this to com.devansh.aerolite, so the answer
+    // here is the same answer the real agent gets.
+    let trusted = AXIsProcessTrusted()
+    print("bundle id:    com.devansh.aerolite")
+    print("trusted:      \(trusted ? "YES" : "NO")")
+
+    if !trusted {
+        print("windows:      unreadable (Accessibility not granted)")
+        print("verdict:      enable AeroLite in System Settings → Privacy & Security → Accessibility")
+        exit(2)
+    }
+
+    var total = 0
+    var apps = 0
+    for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+        let n = AX.windows(of: app.processIdentifier).count
+        if n > 0 { apps += 1; total += n }
+    }
+    print("windows:      \(total) across \(apps) apps")
+    print("verdict:      working")
+    exit(0)
+}
+
+// Render the menu-bar glyph to a PNG so its design can be inspected without screen-recording
+// permission (screencapture cannot read the display from a sandboxed shell).
+if let flag = CommandLine.arguments.firstIndex(of: "--render-glyph"),
+   CommandLine.arguments.count > flag + 1 {
+    let path = CommandLine.arguments[flag + 1]
+    let scale = 12
+    let glyph = Controller.statusGlyph()
+    let width = Int(glyph.size.width) * scale
+    let height = Int(glyph.size.height) * scale
+
+    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+                               bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                               isPlanar: false, colorSpaceName: .deviceRGB,
+                               bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    NSGraphicsContext.current?.imageInterpolation = .none
+    NSColor.white.setFill()
+    NSRect(x: 0, y: 0, width: width, height: height).fill()
+    glyph.draw(in: NSRect(x: 0, y: 0, width: width, height: height))
+    NSGraphicsContext.restoreGraphicsState()
+
+    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+    print("wrote \(path) (\(width)x\(height))")
+    exit(0)
+}
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)   // menu-bar app: no Dock icon, no app switcher entry
+
+// Single instance only. The login agent and a manual launch would otherwise both tile the same
+// windows, fighting over every frame.
+let current = NSRunningApplication.current
+let duplicates = NSRunningApplication.runningApplications(withBundleIdentifier: "com.devansh.aerolite")
+    .filter { $0 != current }
+if !duplicates.isEmpty {
+    log("another instance is already running — exiting")
+    exit(0)
+}
+
+let controller = Controller()
+controller.start()
+
+app.run()

@@ -1,0 +1,227 @@
+import AppKit
+
+// The visible surface of AeroLite: menu-bar glyph, menu, and About panel.
+//
+// Kept separate from Controller so the window-management logic stays readable. Everything here is
+// built with native AppKit so it inherits the system look (vibrancy, dark mode, accessibility
+// labels) instead of approximating it with custom drawing.
+
+extension Controller: NSMenuDelegate {
+
+    /// Monochrome template glyph: one tall pane, two stacked. Template images are tinted by the
+    /// system, so this stays correct in light mode, dark mode, and when the menu bar is highlighted.
+    static func statusGlyph() -> NSImage {
+        let size = NSSize(width: 18, height: 16)
+        let image = NSImage(size: size, flipped: false) { rect in
+            NSColor.black.setFill()
+
+            let gap: CGFloat = 2
+            let leftWidth: CGFloat = 7
+            let rightX = leftWidth + gap
+            let rightWidth = rect.width - rightX
+            let halfHeight = (rect.height - gap) / 2
+
+            // Smaller panes get a smaller radius, the way real window corners scale.
+            func pane(_ r: NSRect, radius: CGFloat) {
+                NSBezierPath(roundedRect: r, xRadius: radius, yRadius: radius).fill()
+            }
+            pane(NSRect(x: 0, y: 0, width: leftWidth, height: rect.height), radius: 2)
+            pane(NSRect(x: rightX, y: halfHeight + gap, width: rightWidth, height: halfHeight), radius: 1.5)
+            pane(NSRect(x: rightX, y: 0, width: rightWidth, height: halfHeight), radius: 1.5)
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "AeroLite"
+        return image
+    }
+
+    private func symbol(_ name: String) -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        return NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config)
+    }
+
+    func installStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = Controller.statusGlyph()
+        item.button?.imagePosition = .imageOnly
+        item.button?.toolTip = "AeroLite — tiling window manager"
+
+        let menu = NSMenu()
+        menu.delegate = self
+        menu.autoenablesItems = false
+        item.menu = menu
+
+        statusItem = item
+        rebuildMenu()
+    }
+
+    /// Rebuilt every time the menu opens, so counts and states are always live.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildMenu()
+    }
+
+    private func rebuildMenu() {
+        guard let menu = statusItem?.menu else { return }
+        menu.removeAllItems()
+
+        let trusted = AXIsProcessTrusted()
+        let total = store.byHash.count
+        let here = store.windows(store.current).count
+
+        // Header: name + a live one-line status, like Apple's own menu-bar utilities.
+        let header = NSMenuItem()
+        let title = NSMutableAttributedString(
+            string: "AeroLite\n",
+            attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .semibold)]
+        )
+        let statusText = trusted
+            ? "Workspace \(store.current) · \(here) window\(here == 1 ? "" : "s") · \(total) managed"
+            : "Accessibility permission needed"
+        title.append(NSMutableAttributedString(
+            string: statusText,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: trusted ? NSColor.secondaryLabelColor : NSColor.systemOrange,
+            ]
+        ))
+        header.attributedTitle = title
+        header.isEnabled = false
+        menu.addItem(header)
+        menu.addItem(.separator())
+
+        // Workspaces, with a checkmark on the current one and live window counts.
+        let workspaceItem = NSMenuItem(title: "Workspaces", action: nil, keyEquivalent: "")
+        workspaceItem.image = symbol("rectangle.split.3x1")
+        let workspaceMenu = NSMenu()
+        for name in orderedWorkspaceNames() {
+            let count = store.windows(name).count
+            let item = NSMenuItem(title: "\(name)  —  \(count) window\(count == 1 ? "" : "s")",
+                                  action: #selector(selectWorkspace(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = name
+            item.state = (name == store.current) ? NSControl.StateValue.on : NSControl.StateValue.off
+            workspaceMenu.addItem(item)
+        }
+        workspaceItem.submenu = workspaceMenu
+        menu.addItem(workspaceItem)
+
+        let layoutItem = NSMenuItem(
+            title: "Layout: \(store.orientation == .horizontal ? "Horizontal" : "Vertical")",
+            action: #selector(toggleOrientationFromMenu), keyEquivalent: "/"
+        )
+        layoutItem.target = self
+        layoutItem.image = symbol(store.orientation == .horizontal
+                                  ? "rectangle.split.2x1"
+                                  : "rectangle.split.1x2")
+        menu.addItem(layoutItem)
+
+        let enabledItem = NSMenuItem(title: "Enabled", action: #selector(toggleEnabled), keyEquivalent: "")
+        enabledItem.target = self
+        enabledItem.state = enabled ? NSControl.StateValue.on : NSControl.StateValue.off
+        enabledItem.image = symbol(enabled ? "checkmark.circle" : "pause.circle")
+        menu.addItem(enabledItem)
+
+        let retile = NSMenuItem(title: "Re-tile Now", action: #selector(reloadNow), keyEquivalent: "r")
+        retile.target = self
+        retile.image = symbol("arrow.triangle.2.circlepath")
+        menu.addItem(retile)
+
+        menu.addItem(.separator())
+
+        if !trusted {
+            let grant = NSMenuItem(title: "Grant Accessibility…", action: #selector(openAccessibility),
+                                   keyEquivalent: "")
+            grant.target = self
+            grant.image = symbol("exclamationmark.triangle")
+            menu.addItem(grant)
+            menu.addItem(.separator())
+        }
+
+        let about = NSMenuItem(title: "About AeroLite", action: #selector(showAboutPanel), keyEquivalent: "")
+        about.target = self
+        about.image = symbol("info.circle")
+        menu.addItem(about)
+
+        let quit = NSMenuItem(title: "Quit AeroLite", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+    }
+
+    /// Numbers first, then letters — a stable, predictable order for the submenu.
+    private func orderedWorkspaceNames() -> [String] {
+        var names = Set(store.workspaces.keys)
+        names.insert(store.current)
+        let numbers = names.filter { $0.count == 1 && $0.first!.isNumber }.sorted()
+        let letters = names.filter { $0.count == 1 && $0.first!.isLetter }.sorted()
+        return numbers + letters
+    }
+
+    @objc func selectWorkspace(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        switchWorkspace(name)
+    }
+
+    @objc func toggleOrientationFromMenu() {
+        toggleOrientation()
+    }
+
+    // MARK: - About
+
+    @objc func showAboutPanel() {
+        if let existing = aboutWindow {
+            existing.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 300),
+                              styleMask: [.titled, .closable, .fullSizeContentView],
+                              backing: .buffered, defer: false)
+        window.title = "About AeroLite"
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.isMovableByWindowBackground = true
+        window.center()
+
+        let content = NSView(frame: window.contentLayoutRect)
+
+        let iconView = NSImageView(frame: NSRect(x: 0, y: 0, width: 96, height: 96))
+        iconView.image = NSApp.applicationIconImage
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+
+        func label(_ text: String, size: CGFloat, weight: NSFont.Weight,
+                   color: NSColor, width: CGFloat) -> NSTextField {
+            let field = NSTextField(wrappingLabelWithString: text)
+            field.font = NSFont.systemFont(ofSize: size, weight: weight)
+            field.textColor = color
+            field.alignment = .center
+            field.frame.size.width = width
+            field.isSelectable = false
+            return field
+        }
+
+        let name = label("AeroLite", size: 20, weight: .semibold, color: .labelColor, width: 320)
+        let version = label("Version 1.1  ·  \(store.byHash.count) windows managed",
+                            size: 11, weight: .regular, color: .secondaryLabelColor, width: 320)
+        let tagline = label("A tiling window manager built for speed:\nno polling, no timers, no work when idle.",
+                            size: 12, weight: .regular, color: .secondaryLabelColor, width: 300)
+
+        var y: CGFloat = 250
+        iconView.frame.origin = NSPoint(x: (360 - 96) / 2, y: y - 96)
+        y -= 96 + 14
+        name.frame.origin = NSPoint(x: 20, y: y - 26); y -= 26 + 4
+        version.frame.origin = NSPoint(x: 20, y: y - 16); y -= 16 + 14
+        tagline.frame.origin = NSPoint(x: 30, y: y - 34)
+
+        content.addSubview(iconView)
+        content.addSubview(name)
+        content.addSubview(version)
+        content.addSubview(tagline)
+        window.contentView = content
+
+        aboutWindow = window
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
